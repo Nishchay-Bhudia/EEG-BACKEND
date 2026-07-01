@@ -1,25 +1,33 @@
 """
 vedantic_logic.py
 =================
-Maps EEG features to two classical Yogic frameworks:
+Maps EEG features to three classical Yogic frameworks:
 
 SWARA RHYTHMS (Svara Shastra / Swara Yoga)
   The Swara is the dominant life-force channel (nadi):
-  - Ida      -- lunar / left nadi -- parasympathetic, receptive, right-brain active
-  - Pingala  -- solar / right nadi -- sympathetic, active, left-brain active
-  - Sushumna -- central / balanced -- both nadis in equilibrium
+  - Ida      — lunar / left nadi — parasympathetic, receptive, right-brain active
+  - Pingala  — solar / right nadi — sympathetic, active, left-brain active
+  - Sushumna — central / balanced — both nadis in equilibrium
 
   Threshold: |right - left| / mean > 10% -> Ida or Pingala.
-             Within 10%                   -> Sushumna.
+  Within 10% -> Sushumna.
 
 TATTVA / CHAKRA CORRELATES (Samkhya-Yoga elemental model)
-  - Gamma surge (>12% relative) -> Potential Tattva Activation / Spanda
-  - High Theta + low Beta       -> Pratyahara Window (sensory withdrawal)
-  - Delta surge + retained Theta -> Turiya Approach (fourth state)
+  - Gamma surge (>12% relative)          -> Potential Tattva Activation / Spanda
+  - High Theta + low Beta                -> Pratyahara Window (sensory withdrawal)
+  - Delta surge + retained Theta         -> Turiya Approach (fourth state)
+
+TRIGUNAS (Samkhya fundamental qualities of manifest nature)
+  - Sattva  — clarity, luminosity, balance
+  - Rajas   — activity, passion, movement
+  - Tamas   — inertia, heaviness, dullness
+  Derived from band powers + Chitta Bhumi + Swara via satva_classifier.py
 """
 
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+from neuro_yogic.satva_classifier import classify_gunas, gunas_label, gunas_note
 
 ASYMMETRY_THRESHOLD = 0.10
 GAMMA_THRESHOLD     = 0.12
@@ -35,6 +43,9 @@ class VedanticReading:
     swara_note:          str       = ""
     tattva_flags:        List[str] = field(default_factory=list)
     contemplative_depth: str       = "Surface"
+    gunas:               dict      = field(default_factory=lambda: {"sattva": 0.334, "rajas": 0.333, "tamas": 0.333})
+    guna_label:          str       = "Balanced"
+    guna_note:           str       = ""
 
     def to_dict(self) -> dict:
         return {
@@ -45,8 +56,17 @@ class VedanticReading:
             },
             "tattva_flags":        self.tattva_flags,
             "contemplative_depth": self.contemplative_depth,
+            "gunas": {
+                "sattva":  self.gunas.get("sattva", 0.0),
+                "rajas":   self.gunas.get("rajas",  0.0),
+                "tamas":   self.gunas.get("tamas",  0.0),
+                "label":   self.guna_label,
+                "note":    self.guna_note,
+            },
         }
 
+
+# ── Swara classification ───────────────────────────────────────────────────────
 
 def _classify_swara(alpha_left: float, alpha_right: float) -> tuple:
     """Determine Swara from hemispheric Alpha asymmetry."""
@@ -63,7 +83,7 @@ def _classify_swara(alpha_left: float, alpha_right: float) -> tuple:
             "Ida (Parasympathetic / Lunar)",
             conf,
             f"Right-hemisphere Alpha is {mag * 100:.1f}% stronger. "
-            "Ida nadi: parasympathetic dominance -- ideal for Yoga Nidra, Yin, deep contemplation.",
+            "Ida nadi: parasympathetic dominance — ideal for Yoga Nidra, Yin, deep contemplation.",
         )
     elif ratio < -ASYMMETRY_THRESHOLD:
         mag  = abs(ratio)
@@ -72,7 +92,7 @@ def _classify_swara(alpha_left: float, alpha_right: float) -> tuple:
             "Pingala (Sympathetic / Solar)",
             conf,
             f"Left-hemisphere Alpha is {mag * 100:.1f}% stronger. "
-            "Pingala nadi: sympathetic dominance -- ideal for Pranayama, dynamic Asana, cognitive work.",
+            "Pingala nadi: sympathetic dominance — ideal for Pranayama, dynamic Asana, cognitive work.",
         )
     else:
         mag  = abs(ratio)
@@ -85,33 +105,37 @@ def _classify_swara(alpha_left: float, alpha_right: float) -> tuple:
         )
 
 
+# ── Tattva flag detection ─────────────────────────────────────────────────────
+
 def _detect_tattva_flags(band_rel: dict, gamma_spike: bool) -> List[str]:
     """Scan band powers for Tattva/Chakra correlate flags."""
     flags = []
 
     if gamma_spike or band_rel.get("gamma", 0) > GAMMA_THRESHOLD:
         flags.append(
-            "Potential Tattva Activation -- Gamma burst >30 Hz detected. "
+            "Potential Tattva Activation — Gamma burst >30 Hz detected. "
             "Associated with cortical binding / insight events (Spanda). "
             "Cross-reference with first-person report."
         )
 
     if band_rel.get("theta", 0) > THETA_HIGH and band_rel.get("beta", 0) < BETA_LOW:
         flags.append(
-            "Pratyahara Window -- Elevated Theta + suppressed Beta. "
+            "Pratyahara Window — Elevated Theta + suppressed Beta. "
             "Sensory withdrawal phase active; thalamic gating engaged. "
             "Optimal moment for inward Dharana (concentration practice)."
         )
 
     if band_rel.get("delta", 0) > DELTA_SURGE and band_rel.get("theta", 0) > 0.20:
         flags.append(
-            "Turiya Approach -- Delta surge with retained Theta in waking context. "
+            "Turiya Approach — Delta surge with retained Theta in waking context. "
             "Rare; may indicate onset of formless absorption. "
             "Verify practitioner is conscious and not drifting into sleep."
         )
 
     return flags
 
+
+# ── Depth assessment ──────────────────────────────────────────────────────────
 
 def _assess_depth(chitta_bhumi: Optional[str], band_rel: dict) -> str:
     """Map Chitta Bhumi label to practitioner-facing depth descriptor."""
@@ -123,27 +147,52 @@ def _assess_depth(chitta_bhumi: Optional[str], band_rel: dict) -> str:
     }
     base = depth_map.get(chitta_bhumi or "", "Surface")
     if base == "Profound" and band_rel.get("beta", 0) > 0.20:
-        base = "Deep"     # High Beta contradicts Niruddha -- transitional moment
+        base = "Deep"       # High Beta contradicts Niruddha — transitional moment
     if base == "Surface" and band_rel.get("alpha", 0) > 0.35:
-        base = "Emerging" # Strong Alpha with Kshipta -> borderline
+        base = "Emerging"   # Strong Alpha with Kshipta -> borderline
     return base
 
 
+# ── Main entry ────────────────────────────────────────────────────────────────
+
 def vedantic_analyze(
-    info: dict,
-    chitta_bhumi: Optional[str] = None,
+    info:          dict,
+    chitta_bhumi:  Optional[str] = None,
 ) -> VedanticReading:
     """
     Main entry: produce a VedanticReading from FeatureExtractor.extract() output.
+
+    Parameters
+    ----------
+    info         : dict — output of FeatureExtractor.extract() (the info dict)
+    chitta_bhumi : str or None — Chitta Bhumi label from YogaClassifier
+
+    Returns
+    -------
+    VedanticReading — with swara, tattva_flags, contemplative_depth, and gunas
     """
     band_rel    = info.get("band_relative", {})
-    alpha_left  = info.get("alpha_left",   0.0)
-    alpha_right = info.get("alpha_right",  0.0)
-    gamma_spike = info.get("gamma_spike",  False)
+    alpha_left  = info.get("alpha_left",  0.0)
+    alpha_right = info.get("alpha_right", 0.0)
+    gamma_spike = info.get("gamma_spike", False)
 
+    # Swara
     swara, confidence, note = _classify_swara(alpha_left, alpha_right)
+
+    # Tattva flags
     tattva_flags = _detect_tattva_flags(band_rel, gamma_spike)
-    depth        = _assess_depth(chitta_bhumi, band_rel)
+
+    # Contemplative depth
+    depth = _assess_depth(chitta_bhumi, band_rel)
+
+    # Trigunas — pass the swara string so satva_classifier can use it
+    gunas = classify_gunas(
+        band_rel=band_rel,
+        chitta_bhumi=chitta_bhumi,
+        swara=swara,
+    )
+    label = gunas_label(gunas)
+    note_text = gunas_note(gunas)
 
     return VedanticReading(
         swara               = swara,
@@ -151,4 +200,7 @@ def vedantic_analyze(
         swara_note          = note,
         tattva_flags        = tattva_flags,
         contemplative_depth = depth,
+        gunas               = gunas,
+        guna_label          = label,
+        guna_note           = note_text,
     )
