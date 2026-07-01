@@ -22,7 +22,9 @@ Send a JSON body with 2 seconds of raw EEG from the headband:
 
     {
         "eeg_data":    [[ch0_s0, ch0_s1, ...], [ch1_s0, ...]],  // (n_channels x n_samples)
-        "sample_rate": 256
+        "sample_rate": 256,
+        "blood_oxygen": 98.5,   // optional — pass if headband provides it
+        "heart_rate":   72.0    // optional — pass if headband provides it
     }
 
 Or, if your frontend already computes band powers (e.g. via muse-js):
@@ -31,11 +33,14 @@ Or, if your frontend already computes band powers (e.g. via muse-js):
     {
         "delta": 0.12, "theta": 0.18, "alpha": 0.40,
         "beta": 0.20, "gamma": 0.10,
-        "alpha_left": 0.20, "alpha_right": 0.25
+        "alpha_left": 0.20, "alpha_right": 0.25,
+        "blood_oxygen": 98.5,   // optional
+        "heart_rate":   72.0    // optional
     }
 
 Both endpoints return the same JSON response shape, now including a
-"gunas" block with Sattva / Rajas / Tamas percentages.
+"gunas" block with Sattva / Rajas / Tamas percentages, and optionally
+"blood_oxygen" / "heart_rate" if those were provided in the request.
 
 CORS
 ----
@@ -54,7 +59,7 @@ from flask_cors import CORS
 
 from neuro_yogic.data_generator import DEFAULT_MODEL_PATH, save_dataset
 from neuro_yogic.feature_extractor import FeatureExtractor
-from neuro_yogic.satva_classifier import classify_gunas          # ← NEW
+from neuro_yogic.satva_classifier import classify_gunas
 from neuro_yogic.vedantic_logic import vedantic_analyze
 from neuro_yogic.yoga_classifier import YogaClassifier
 
@@ -93,20 +98,31 @@ def _startup_training() -> None:
             log.error(f"[Startup] Training failed: {exc}")
 
 
-def _build_response(chitta: str, probs: dict, info: dict) -> dict:
-    """Assemble the standard API response JSON."""
+def _safe_float(value):
+    """Convert a value to float, returning None if it is None or invalid."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_response(chitta: str, probs: dict, info: dict,
+                    blood_oxygen=None, heart_rate=None) -> dict:
+    """Assemble the standard API response JSON.
+
+    blood_oxygen and heart_rate are optional floats passed through from the
+    request body unchanged. If None (device does not support the metric),
+    the keys are omitted from the response so callers can distinguish
+    'unavailable' from 'zero'.
+    """
     reading  = vedantic_analyze(info, chitta_bhumi=chitta)
     band_rel = info.get("band_relative", {})
 
-    # ── Trigunas ────────────────────────────────────────────────────
-    # classify_gunas() accepts the relative band-power dict and the
-    # current Chitta Bhumi state.  It returns a dict with keys:
-    #   sattva, rajas, tamas  (floats that sum to 1.0)
-    #   label                 ("Sattvic" / "Rajasic" / "Tamasic" / "Balanced")
-    #   note                  (short human-readable interpretation)
-    gunas = classify_gunas(band_rel, chitta_bhumi=chitta)          # ← NEW
+    gunas = classify_gunas(band_rel, chitta_bhumi=chitta)
 
-    return {
+    response = {
         "chitta_bhumi": {
             "state":         chitta,
             "confidence":    f"{max(probs.values()) * 100:.1f}%",
@@ -125,8 +141,19 @@ def _build_response(chitta: str, probs: dict, info: dict) -> dict:
             ),
         },
         "is_padded": info.get("is_padded", False),
-        "gunas":     gunas,                                         # ← NEW
+        "gunas":     gunas,
     }
+
+    # Only include vitals if they were actually provided by the device.
+    # Omitting the key entirely signals 'unavailable' to the frontend.
+    bo = _safe_float(blood_oxygen)
+    hr = _safe_float(heart_rate)
+    if bo is not None:
+        response["blood_oxygen"] = round(bo, 2)
+    if hr is not None:
+        response["heart_rate"] = round(hr, 2)
+
+    return response
 
 
 # ── Routes ────────────────────────────────────────────────────────────
@@ -148,13 +175,15 @@ def analyze():
 
     Request body (JSON)
     -------------------
-    eeg_data    : list[list[float]]  -- shape (n_channels, n_samples), raw µV values
-    sample_rate : int                -- samples per second (e.g. 256 for Muse 2)
+    eeg_data     : list[list[float]]  -- shape (n_channels, n_samples), raw µV values
+    sample_rate  : int                -- samples per second (e.g. 256 for Muse 2)
+    blood_oxygen : float | null       -- optional SpO₂ % from headband (omit or null if unsupported)
+    heart_rate   : float | null       -- optional HR BPM from headband (omit or null if unsupported)
 
     Returns
     -------
     JSON with chitta_bhumi, swara, tattva, depth, eeg_spectrum,
-    hemispheric_asymmetry, and gunas (Sattva/Rajas/Tamas).
+    hemispheric_asymmetry, gunas, and optionally blood_oxygen / heart_rate.
     """
     if not _model_ready:
         return jsonify({"error": "Model is still loading. Try again in a few seconds."}), 503
@@ -163,8 +192,12 @@ def analyze():
     if not body:
         return jsonify({"error": "Request body must be JSON."}), 400
 
-    eeg_data = body.get("eeg_data")
+    eeg_data    = body.get("eeg_data")
     sample_rate = int(body.get("sample_rate", 256))
+
+    # Vitals are fully optional — no error if missing or null.
+    blood_oxygen = body.get("blood_oxygen")
+    heart_rate   = body.get("heart_rate")
 
     if eeg_data is None:
         return jsonify({"error": "Missing 'eeg_data' field."}), 400
@@ -196,7 +229,7 @@ def analyze():
         log.exception("Classification failed")
         return jsonify({"error": f"Classification failed: {exc}"}), 500
 
-    return jsonify(_build_response(chitta, probs, info))
+    return jsonify(_build_response(chitta, probs, info, blood_oxygen, heart_rate))
 
 
 @app.post("/analyze/bands")
@@ -208,8 +241,10 @@ def analyze_bands():
     -------------------
     delta, theta, alpha, beta, gamma : float  -- relative band powers (0-1)
     alpha_left, alpha_right           : float  -- hemispheric alpha powers (optional)
+    blood_oxygen                      : float | null  -- optional SpO₂ % (omit or null if unsupported)
+    heart_rate                        : float | null  -- optional HR BPM (omit or null if unsupported)
 
-    All values should be relative powers that sum to ~1.
+    All band values should be relative powers that sum to ~1.
     """
     if not _model_ready:
         return jsonify({"error": "Model is still loading. Try again in a few seconds."}), 503
@@ -233,6 +268,10 @@ def analyze_bands():
         alpha_right = float(body.get("alpha_right", alpha / 2))
     except (TypeError, ValueError) as exc:
         return jsonify({"error": f"Invalid band power value: {exc}"}), 400
+
+    # Vitals are fully optional — no error if missing or null.
+    blood_oxygen = body.get("blood_oxygen")
+    heart_rate   = body.get("heart_rate")
 
     asymmetry = alpha_right - alpha_left
     total     = delta + theta + alpha + beta + gamma or 1e-10
@@ -263,7 +302,7 @@ def analyze_bands():
         log.exception("Classification failed")
         return jsonify({"error": f"Classification failed: {exc}"}), 500
 
-    return jsonify(_build_response(chitta, probs, info))
+    return jsonify(_build_response(chitta, probs, info, blood_oxygen, heart_rate))
 
 
 # ── Entry point ───────────────────────────────────────────────────────
