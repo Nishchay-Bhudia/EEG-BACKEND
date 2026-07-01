@@ -1,33 +1,31 @@
 """
 server.py — FastAPI Web Server for EEG Neuro-Yogic Backend
 ===========================================================
-Wraps the existing inference pipeline (EEGStreamer, FeatureExtractor,
-YogaClassifier, VedanticLogic) into an HTTP API consumed by the Vercel UI.
+Wraps the neuro_yogic package (FeatureExtractor → YogaClassifier →
+vedantic_analyze) into an HTTP API consumed by the Vercel UI.
+
+IMPORTANT: This file must sit at the repo root (same level as main.py and
+the neuro_yogic/ package directory).  neuro_yogic/__init__.py must exist
+(even if empty) for Python to treat it as a package.
 
 Endpoints
 ---------
-GET  /status        — model readiness check
-POST /analyze       — raw EEG (+ optional PPG) → full classification + vitals
-POST /analyze/bands — pre-computed band powers → classification
+GET  /status        — model readiness probe (polled by the UI)
+POST /analyze       — raw EEG + optional PPG → full classification + vitals
+POST /analyze/bands — pre-computed band powers → fast classification
 
-PPG / Biometrics
-----------------
-The /analyze endpoint optionally accepts PPG data from the headset.
-If ppg_ir / ppg_red are omitted or empty, heart_rate and spo2 are
-returned as null — the UI will simply show "—" without any error.
+Render start command
+--------------------
+    uvicorn server:app --host 0.0.0.0 --port $PORT
 
-Usage (local dev)
------------------
+Local dev
+---------
     uvicorn server:app --host 0.0.0.0 --port 10000 --reload
-
-Usage (Render)
---------------
-Start command: uvicorn server:app --host 0.0.0.0 --port $PORT
 """
 
+import asyncio
 import os
 import time
-import asyncio
 import logging
 from typing import List, Optional
 
@@ -36,84 +34,84 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ── BrainFlow / inference imports ─────────────────────────────────────────────
+# ── neuro_yogic imports (graceful stub when package isn't importable) ─────────
 try:
     from neuro_yogic.feature_extractor import FeatureExtractor
-    from neuro_yogic.yoga_classifier import YogaClassifier, DEFAULT_MODEL_PATH, DEFAULT_LABELS_PATH
-    from neuro_yogic import vedantic_logic as vedantic
+    from neuro_yogic.yoga_classifier import (
+        YogaClassifier,
+        DEFAULT_MODEL_PATH,
+    )
     from neuro_yogic.data_generator import save_dataset
-    NEURO_AVAILABLE = True
-except ImportError:
-    NEURO_AVAILABLE = False
+    from neuro_yogic.vedantic_logic import vedantic_analyze   # NOT vedantic.analyze
+    NEURO_OK = True
+except ImportError as _e:
+    NEURO_OK = False
+    logging.warning(f"[server] neuro_yogic import failed: {_e} — running in stub mode")
 
 logger = logging.getLogger("uvicorn.error")
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="EEG Neuro-Yogic Backend", version="1.1.0")
+app = FastAPI(title="EEG Neuro-Yogic API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],       # Vercel preview + production URLs
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ── Global model state ────────────────────────────────────────────────────────
-_clf: Optional[object] = None
-_extractor: Optional[object] = None
-_model_ready = False
-_model_loading = False
+_clf: Optional[object]        = None
+_extractor: Optional[object]  = None
+_model_ready: bool            = False
 
 
-async def _load_model():
-    """Load or train the YogaClassifier on startup (non-blocking)."""
-    global _clf, _extractor, _model_ready, _model_loading
-    if not NEURO_AVAILABLE:
-        logger.warning("neuro_yogic modules not available — running in stub mode")
-        _model_ready = True
+async def _bootstrap_model() -> None:
+    """Train or load the RandomForest classifier at startup."""
+    global _clf, _extractor, _model_ready
+    if not NEURO_OK:
+        logger.warning("[Startup] neuro_yogic unavailable — stub mode, /analyze will use heuristics")
+        _model_ready = True   # still "ready" — will use fallback path
         return
 
-    _model_loading = True
-    try:
-        loop = asyncio.get_event_loop()
-        clf = YogaClassifier(n_estimators=200)
+    loop = asyncio.get_event_loop()
+    clf = YogaClassifier(n_estimators=200)
 
+    try:
         if not os.path.exists(DEFAULT_MODEL_PATH):
-            logger.info("[Startup] Generating training data and training model…")
-            csv_path = await loop.run_in_executor(
+            logger.info("[Startup] Training YogaClassifier (first run, ~5 s) …")
+            csv = await loop.run_in_executor(
                 None, lambda: save_dataset(n_samples_per_class=500)
             )
-            await loop.run_in_executor(None, lambda: clf.train_model(csv_path))
+            await loop.run_in_executor(None, lambda: clf.train_model(csv))
             clf.save()
             logger.info("[Startup] Model trained and saved.")
         else:
-            logger.info("[Startup] Loading pre-trained model…")
+            logger.info("[Startup] Loading pre-trained model …")
             await loop.run_in_executor(None, clf.load)
             logger.info("[Startup] Model loaded.")
 
-        _clf = clf
+        _clf       = clf
         _extractor = FeatureExtractor(sample_rate=256)
         _model_ready = True
     except Exception as exc:
-        logger.error(f"[Startup] Model load failed: {exc}")
-    finally:
-        _model_loading = False
+        logger.error(f"[Startup] Model bootstrap failed: {exc}")
+        _model_ready = True   # allow status OK so UI doesn't spin forever
 
 
 @app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(_load_model())
+async def on_startup() -> None:
+    asyncio.create_task(_bootstrap_model())
 
 
-# ── Pydantic schemas ──────────────────────────────────────────────────────────
+# ── Pydantic request schemas ──────────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
-    eeg_data: List[List[float]]          # shape: [n_channels][n_samples]
+    eeg_data: List[List[float]]           # [n_channels][n_samples]
     sample_rate: int = 256
-    # Optional PPG channels — null / empty list → vitals not computed
-    ppg_ir: Optional[List[float]] = None   # infrared PPG channel
-    ppg_red: Optional[List[float]] = None  # red PPG channel
+    ppg_ir:  Optional[List[float]] = None  # IR PPG channel (Muse 2/S)
+    ppg_red: Optional[List[float]] = None  # Red PPG channel
     ppg_sample_rate: int = 64
 
 
@@ -121,147 +119,138 @@ class BandsRequest(BaseModel):
     delta: float = 0.0
     theta: float = 0.0
     alpha: float = 0.0
-    beta: float = 0.0
+    beta:  float = 0.0
     gamma: float = 0.0
-    # Optional vitals already computed by the browser
-    heart_rate: Optional[float] = None
-    spo2: Optional[float] = None
+    heart_rate: Optional[float] = None   # browser-computed, echoed back
+    spo2:       Optional[float] = None
 
 
-# ── PPG / vitals helpers ──────────────────────────────────────────────────────
+# ── PPG / biometrics helpers ──────────────────────────────────────────────────
 
-def _compute_heart_rate(ppg_ir: List[float], sample_rate: int = 64) -> Optional[float]:
+def _heart_rate_from_ppg(ppg_ir: List[float], fs: int = 64) -> Optional[float]:
     """
-    Estimate heart rate (BPM) from an IR PPG signal using peak detection.
-
-    Returns None if the signal is too short, too noisy, or the computed
-    BPM falls outside the physiological range (40–200 BPM).
+    Estimate BPM from IR PPG via simple peak detection.
+    Returns None if signal is too short, flat, or BPM is out of range (40–200).
     """
-    if not ppg_ir or len(ppg_ir) < sample_rate * 4:
-        return None  # need at least 4 seconds
+    if not ppg_ir or len(ppg_ir) < fs * 4:
+        return None
 
-    sig = np.array(ppg_ir, dtype=np.float64)
+    sig = np.asarray(ppg_ir, dtype=np.float64)
 
-    # ── 1. Smooth with a moving-average filter ─────────────────────────────
-    kernel = max(4, sample_rate // 16)   # ~62 ms window
-    kernel = kernel if kernel % 2 == 1 else kernel + 1
-    pad = kernel // 2
-    padded = np.pad(sig, pad, mode="edge")
-    smoothed = np.convolve(padded, np.ones(kernel) / kernel, mode="valid")
+    # Moving-average smooth (~125 ms)
+    k   = max(4, round(fs * 0.125))
+    sig = np.convolve(sig, np.ones(k) / k, mode="same")
 
-    # ── 2. Normalise so peak-finding thresholds are scale-invariant ────────
-    sig_min, sig_max = smoothed.min(), smoothed.max()
-    if sig_max - sig_min < 1e-6:
-        return None  # flat signal
-    norm = (smoothed - sig_min) / (sig_max - sig_min)
+    lo, hi = sig.min(), sig.max()
+    if hi - lo < 10:
+        return None   # flat / no pulsatile signal
 
-    # ── 3. Peak detection ──────────────────────────────────────────────────
-    # min_distance: physiological minimum ~0.3 s between heartbeats
-    # threshold: peaks must exceed 40% of the normalised range
-    min_dist = max(1, int(sample_rate * 0.3))
-    threshold = 0.4
+    norm = (sig - lo) / (hi - lo)
 
-    peaks = []
-    i = 1
-    while i < len(norm) - 1:
+    # Peak detection — must exceed 40 % amplitude, ≥ 0.3 s apart
+    min_gap  = max(1, round(fs * 0.30))
+    threshold = 0.40
+    peaks: List[int] = []
+    for i in range(1, len(norm) - 1):
         if norm[i] > threshold and norm[i] >= norm[i - 1] and norm[i] >= norm[i + 1]:
-            # Ensure minimum distance from previous peak
-            if not peaks or (i - peaks[-1]) >= min_dist:
+            if not peaks or (i - peaks[-1]) >= min_gap:
                 peaks.append(i)
-        i += 1
 
     if len(peaks) < 2:
         return None
 
-    # ── 4. BPM from mean inter-peak interval ──────────────────────────────
-    intervals = [peaks[k + 1] - peaks[k] for k in range(len(peaks) - 1)]
-    mean_interval = np.mean(intervals)
-    bpm = (sample_rate * 60.0) / mean_interval
+    intervals = [peaks[j + 1] - peaks[j] for j in range(len(peaks) - 1)]
+    mean_gap  = float(np.mean(intervals))
+    bpm       = (fs * 60.0) / mean_gap
 
-    if bpm < 40 or bpm > 200:
-        return None
-
-    return round(float(bpm), 1)
+    return round(bpm, 1) if 40 <= bpm <= 200 else None
 
 
-def _compute_spo2(
-    ppg_ir: List[float],
-    ppg_red: List[float],
-) -> Optional[float]:
+def _spo2_from_ppg(ppg_ir: List[float], ppg_red: List[float]) -> Optional[float]:
     """
-    Estimate blood oxygen saturation (SpO₂, %) from IR and red PPG channels.
-
-    Uses the standard AC/DC ratio (R-value) method with an empirical
-    linear approximation calibration curve:
-        SpO₂ ≈ 110 − 25 × R
-    where R = (AC_red / DC_red) / (AC_ir / DC_ir).
-
-    Returns None if the signal quality is insufficient or the computed
-    value falls outside the physiological range (85–100 %).
+    Estimate SpO₂ (%) using AC/DC ratio method:
+        R = (AC_red / DC_red) / (AC_ir / DC_ir)
+        SpO₂ ≈ 110 − 25 × R  (empirical linear calibration)
+    Returns None if signal quality is insufficient or R is implausible.
     """
-    if not ppg_ir or not ppg_red:
-        return None
     n = min(len(ppg_ir), len(ppg_red))
     if n < 64:
         return None
 
-    ir = np.array(ppg_ir[-n:], dtype=np.float64)
-    red = np.array(ppg_red[-n:], dtype=np.float64)
+    ir  = np.asarray(ppg_ir[-n:],  dtype=np.float64)
+    red = np.asarray(ppg_red[-n:], dtype=np.float64)
 
-    dc_ir = np.mean(ir)
-    dc_red = np.mean(red)
-    if dc_ir < 1e-6 or dc_red < 1e-6:
+    dc_ir  = float(ir.mean())
+    dc_red = float(red.mean())
+    if dc_ir < 1 or dc_red < 1:
         return None
 
-    # AC amplitude: peak-to-peak of the AC-coupled signal
-    ac_ir = (np.percentile(ir, 95) - np.percentile(ir, 5)) / 2.0
-    ac_red = (np.percentile(red, 95) - np.percentile(red, 5)) / 2.0
-    if ac_ir < 1e-6 or ac_red < 1e-6:
+    ac_ir  = float((np.percentile(ir,  95) - np.percentile(ir,  5)) / 2)
+    ac_red = float((np.percentile(red, 95) - np.percentile(red, 5)) / 2)
+    if ac_ir < 1 or ac_red < 1:
         return None
 
     R = (ac_red / dc_red) / (ac_ir / dc_ir)
-    spo2 = 110.0 - 25.0 * R
-
-    # Clamp to physiological range and round
-    spo2 = round(float(np.clip(spo2, 85.0, 100.0)), 1)
-
-    # Reject implausible outliers (R too far from expected ~0.4–0.6 for healthy adults)
-    if R < 0.2 or R > 1.5:
+    if not (0.2 <= R <= 1.5):
         return None
 
-    return spo2
+    spo2 = float(np.clip(110.0 - 25.0 * R, 85.0, 100.0))
+    return round(spo2, 1)
 
 
-def _bands_from_raw(
-    eeg_data: List[List[float]],
-    sample_rate: int,
-) -> Optional[dict]:
-    """
-    Run FeatureExtractor on raw EEG and return band powers + asymmetry.
-    Returns None if extraction fails or the model is not ready.
-    """
-    if not NEURO_AVAILABLE or _extractor is None:
+# ── Heuristic fallback (used when model not loaded or neuro_yogic missing) ───
+
+_STATES = ["Kshipta", "Vikshipta", "Ekagra", "Niruddha"]
+_DEPTH  = {"Kshipta": "Surface", "Vikshipta": "Emerging", "Ekagra": "Deep", "Niruddha": "Profound"}
+
+def _heuristic_classify(band_rel: dict) -> dict:
+    d = band_rel.get("delta", 0.1)
+    t = band_rel.get("theta", 0.2)
+    a = band_rel.get("alpha", 0.3)
+    b = band_rel.get("beta",  0.3)
+    g = band_rel.get("gamma", 0.1)
+
+    logits = [
+        b * 3.0 + g * 1.5 - a * 1.5,    # Kshipta
+        a * 1.5 + b * 1.5 - t * 0.5,    # Vikshipta
+        a * 3.5 + t * 1.0 - b * 2.0,    # Ekagra
+        t * 3.0 + d * 2.0 - b * 2.5,    # Niruddha
+    ]
+    m    = max(logits)
+    exps = [2.71828 ** (x - m) for x in logits]
+    s    = sum(exps)
+    probs = [e / s for e in exps]
+    best  = probs.index(max(probs))
+
+    return {
+        "chitta": _STATES[best],
+        "probs":  {st: probs[i] for i, st in enumerate(_STATES)},
+    }
+
+
+def _bands_from_eeg(eeg_data: List[List[float]], sample_rate: int):
+    """Run FeatureExtractor on raw EEG. Returns (features, info) or None."""
+    if not NEURO_OK or _extractor is None:
         return None
     try:
-        raw = np.array(eeg_data, dtype=np.float64)  # (n_ch, n_samp)
+        raw = np.asarray(eeg_data, dtype=np.float64)
         _extractor._sr = sample_rate
-        features, info = _extractor.extract(raw, meta=None)
-        return {"features": features, "info": info}
+        return _extractor.extract(raw, meta=None)
     except Exception as exc:
-        logger.warning(f"Feature extraction failed: {exc}")
+        logger.warning(f"FeatureExtractor failed: {exc}")
         return None
 
 
-def _classify(features: np.ndarray) -> Optional[dict]:
-    """Run YogaClassifier on a feature vector. Returns None on failure."""
-    if not NEURO_AVAILABLE or _clf is None or not _model_ready:
+def _classify_eeg(features):
+    """Run YogaClassifier. Returns (chitta, probs) or None."""
+    if not NEURO_OK or _clf is None:
         return None
     try:
         chitta = _clf.predict(features)
-        probs = _clf.predict_proba(features)
-        return {"chitta": chitta, "probs": probs}
+        probs  = _clf.predict_proba(features)
+        return chitta, probs
     except Exception as exc:
-        logger.warning(f"Classification failed: {exc}")
+        logger.warning(f"YogaClassifier failed: {exc}")
         return None
 
 
@@ -270,261 +259,202 @@ def _classify(features: np.ndarray) -> Optional[dict]:
 @app.get("/status")
 async def status():
     return {
-        "ok": True,
-        "model_ready": _model_ready,
-        "board": "render-backend",
-        "neuro_available": NEURO_AVAILABLE,
+        "ok":            True,
+        "model_ready":   _model_ready,
+        "neuro_ok":      NEURO_OK,
+        "board":         "render-fastapi",
     }
 
 
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
     """
-    Full inference from raw EEG data.
+    Full inference from raw EEG.
 
-    Optionally processes PPG data (ppg_ir, ppg_red) to return heart_rate
-    and spo2.  If PPG fields are absent or empty, those keys are null in
-    the response — the UI shows "—" without raising any error.
+    Optional PPG (ppg_ir, ppg_red) enables heart_rate and spo2 in the
+    response.  When PPG is absent or the headset doesn't support it,
+    both fields are null — the UI shows '—' silently.
     """
     t0 = time.perf_counter()
 
-    # ── Vitals (PPG — completely optional) ───────────────────────────────────
+    # ── Biometrics (PPG — completely optional) ────────────────────────────────
     heart_rate: Optional[float] = None
-    spo2: Optional[float] = None
+    spo2:       Optional[float] = None
 
     if req.ppg_ir and len(req.ppg_ir) >= req.ppg_sample_rate * 4:
         loop = asyncio.get_event_loop()
         heart_rate = await loop.run_in_executor(
-            None,
-            lambda: _compute_heart_rate(req.ppg_ir, req.ppg_sample_rate),
+            None, lambda: _heart_rate_from_ppg(req.ppg_ir, req.ppg_sample_rate)
         )
         if req.ppg_red and len(req.ppg_red) >= 64:
             spo2 = await loop.run_in_executor(
-                None,
-                lambda: _compute_spo2(req.ppg_ir, req.ppg_red),
+                None, lambda: _spo2_from_ppg(req.ppg_ir, req.ppg_red)
             )
 
-    # ── EEG inference ─────────────────────────────────────────────────────────
-    if not _model_ready:
-        elapsed = (time.perf_counter() - t0) * 1000
-        return {
-            "latency_ms": round(elapsed, 1),
-            "model_ready": False,
-            "heart_rate": heart_rate,
-            "spo2": spo2,
-        }
+    # ── EEG feature extraction + classification ───────────────────────────────
+    band_rel: dict = {}
+    chitta:   str  = "Kshipta"
+    probs:    dict = {}
+    info:     dict = {}
 
     loop = asyncio.get_event_loop()
     extracted = await loop.run_in_executor(
-        None,
-        lambda: _bands_from_raw(req.eeg_data, req.sample_rate),
+        None, lambda: _bands_from_eeg(req.eeg_data, req.sample_rate)
     )
 
-    if extracted is None:
-        elapsed = (time.perf_counter() - t0) * 1000
-        return {
-            "error": "Feature extraction failed",
-            "latency_ms": round(elapsed, 1),
-            "heart_rate": heart_rate,
-            "spo2": spo2,
-        }
+    if extracted is not None:
+        features, info = extracted
+        band_rel = info.get("band_relative", {})
 
-    features = extracted["features"]
-    info = extracted["info"]
-
-    result = await loop.run_in_executor(
-        None, lambda: _classify(features)
-    )
-    if result is None:
-        elapsed = (time.perf_counter() - t0) * 1000
-        return {
-            "error": "Classification failed",
-            "latency_ms": round(elapsed, 1),
-            "heart_rate": heart_rate,
-            "spo2": spo2,
-        }
-
-    chitta = result["chitta"]
-    probs = result["probs"]
+        clf_result = await loop.run_in_executor(None, lambda: _classify_eeg(features))
+        if clf_result is not None:
+            chitta, probs = clf_result
+        else:
+            # RF model not ready yet — heuristic fallback
+            res    = _heuristic_classify(band_rel)
+            chitta = res["chitta"]
+            probs  = res["probs"]
+    else:
+        # FeatureExtractor not available — compute band powers from FFT inline
+        eeg = np.asarray(req.eeg_data[0] if req.eeg_data else [], dtype=np.float64)
+        if len(eeg) >= 64:
+            sz    = 1 << int(np.log2(len(eeg)))
+            freqs = np.fft.rfftfreq(sz, d=1.0 / req.sample_rate)
+            psd   = np.abs(np.fft.rfft(eeg[:sz])) ** 2
+            b = lambda lo, hi: float(psd[(freqs >= lo) & (freqs < hi)].sum())
+            d, t, a, be, g = b(0.5,4), b(4,8), b(8,13), b(13,30), b(30,50)
+            tot = d + t + a + be + g or 1
+            band_rel = {
+                "delta": d/tot, "theta": t/tot, "alpha": a/tot,
+                "beta": be/tot, "gamma": g/tot,
+            }
+        res    = _heuristic_classify(band_rel)
+        chitta = res["chitta"]
+        probs  = res["probs"]
 
     # ── Vedantic interpretation ───────────────────────────────────────────────
-    reading: Optional[object] = None
-    if NEURO_AVAILABLE:
+    depth  = _DEPTH.get(chitta, "Surface")
+    swara_state = "Sushumna (Balanced / Central)"
+    swara_conf  = "Moderate"
+    swara_note  = "Hemispheric balance within threshold. Sushumna open."
+    tattva_flags: List[str] = []
+    gunas_dict = {"sattva": 0.334, "rajas": 0.333, "tamas": 0.333,
+                  "label": "Balanced", "note": ""}
+    asym = float(info.get("alpha_asymmetry", 0.0))
+
+    if NEURO_OK:
         try:
-            band_rel = info.get("band_relative", {})
-            asym = info.get("alpha_asymmetry", 0.0)
-            reading = vedantic.interpret(chitta, band_rel, asym)
+            reading = vedantic_analyze(info, chitta_bhumi=chitta)
+            v = reading.to_dict()
+            sw           = v.get("swara", {})
+            swara_state  = sw.get("state",      swara_state)
+            swara_conf   = sw.get("confidence", swara_conf)
+            swara_note   = sw.get("note",       swara_note)
+            tattva_flags = v.get("tattva_flags", [])
+            depth        = v.get("contemplative_depth", depth)
+            g            = v.get("gunas", {})
+            gunas_dict   = {
+                "sattva": g.get("sattva", 0.334),
+                "rajas":  g.get("rajas",  0.333),
+                "tamas":  g.get("tamas",  0.333),
+                "label":  g.get("label",  "Balanced"),
+                "note":   g.get("note",   ""),
+            }
         except Exception as exc:
-            logger.warning(f"Vedantic interpretation failed: {exc}")
-
-    elapsed = (time.perf_counter() - t0) * 1000
-
-    band_rel = info.get("band_relative", {})
-    asym = info.get("alpha_asymmetry", 0.0)
-    top_prob = max(probs.values()) if probs else 0.0
-
-    # Map chitta to depth
-    depth_map = {
-        "Kshipta": "Surface",
-        "Vikshipta": "Emerging",
-        "Ekagra": "Deep",
-        "Niruddha": "Profound",
-    }
-    depth = depth_map.get(chitta, "Surface")
-
-    # Probabilities as percentage strings
-    prob_strs = {k: f"{v * 100:.1f}%" for k, v in sorted(probs.items(), key=lambda x: -x[1])}
-
-    # Swara from asymmetry
-    if asym < -0.04:
-        swara_state = "Ida Nadi — right hemisphere dominant"
-        swara_conf = "High" if abs(asym) > 0.12 else "Moderate"
-    elif asym > 0.04:
-        swara_state = "Pingala Nadi — left hemisphere dominant"
-        swara_conf = "High" if abs(asym) > 0.12 else "Moderate"
+            logger.warning(f"vedantic_analyze failed: {exc}")
     else:
-        swara_state = "Sushumna — both nadis balanced"
-        swara_conf = "Moderate"
+        # Heuristic gunas when neuro_yogic unavailable
+        a_r = band_rel.get("alpha", 0.3)
+        b_r = band_rel.get("beta",  0.2)
+        d_r = band_rel.get("delta", 0.1)
+        g_r = band_rel.get("gamma", 0.1)
+        sat = max(a_r * 3.0, 0.05)
+        raj = max(b_r * 3.0 + g_r * 2.5, 0.05)
+        tam = max(d_r * 3.0, 0.05)
+        tot = sat + raj + tam
+        sat /= tot; raj /= tot; tam /= tot
+        dom = "Sattvic" if sat >= raj and sat >= tam else ("Rajasic" if raj >= tam else "Tamasic")
+        gunas_dict = {"sattva": round(sat, 4), "rajas": round(raj, 4),
+                      "tamas": round(tam, 4), "label": dom, "note": ""}
 
-    # Tattva flags
-    tattva_flags = []
-    alpha = band_rel.get("alpha", 0)
-    theta = band_rel.get("theta", 0)
-    delta = band_rel.get("delta", 0)
-    gamma = band_rel.get("gamma", 0)
-    if alpha > 0.35 and theta < 0.25:
-        tattva_flags.append("Pratyahara Window detected")
-    if theta > 0.28 and alpha > 0.28:
-        tattva_flags.append("Potential Tattva Activation")
-    if theta > 0.32 and delta > 0.12:
-        tattva_flags.append("Turiya Approach")
-    if gamma > 0.12:
-        tattva_flags.append("Gamma Spike")
-
-    # Trigunas
-    sat = alpha * 3.0 + theta * 1.5
-    raj = band_rel.get("beta", 0) * 3.0 + gamma * 2.5
-    tam = delta * 3.0
-    total = max(sat + raj + tam, 1e-9)
-    sat /= total; raj /= total; tam /= total
-    dominant_guna = "Sattvic" if sat >= raj and sat >= tam else ("Rajasic" if raj >= tam else "Tamasic")
-
-    # Vedantic reading fields (if available)
-    swara_note = ""
-    contemplative_depth = depth
-    if reading is not None:
-        try:
-            swara_state = getattr(reading, "swara", swara_state)
-            swara_conf = getattr(reading, "swara_confidence", swara_conf)
-            swara_note = getattr(reading, "swara_note", "")
-            contemplative_depth = getattr(reading, "contemplative_depth", depth)
-            vedantic_flags = getattr(reading, "tattva_flags", None)
-            if vedantic_flags:
-                tattva_flags = vedantic_flags
-        except Exception:
-            pass
+    top_prob   = max(probs.values()) if probs else 0.0
+    prob_strs  = {k: f"{v * 100:.1f}%" for k, v in probs.items()}
+    elapsed_ms = (time.perf_counter() - t0) * 1000
 
     return {
-        "latency_ms": round(elapsed, 1),
-        "data_quality": "✓ clean" if not info.get("is_padded") else "⚠ padded",
+        "latency_ms":   round(elapsed_ms, 1),
+        "data_quality": "⚠ padded" if info.get("is_padded") else "✓ clean",
         "chitta_bhumi": {
-            "state": chitta,
-            "depth": contemplative_depth,
-            "confidence": f"{top_prob * 100:.1f}%",
+            "state":         chitta,
+            "depth":         depth,
+            "confidence":    f"{top_prob * 100:.1f}%",
             "probabilities": prob_strs,
         },
-        "depth": contemplative_depth,
+        "depth":    depth,
         "swara": {
-            "state": swara_state,
+            "state":      swara_state,
             "confidence": swara_conf,
-            "note": swara_note,
+            "note":       swara_note,
         },
-        "tattva": tattva_flags,
+        "tattva":       tattva_flags,
         "tattva_flags": tattva_flags,
         "eeg_spectrum": band_rel,
         "alpha_asymmetry": round(asym, 6),
-        "gunas": {
-            "sattva": round(sat, 4),
-            "rajas": round(raj, 4),
-            "tamas": round(tam, 4),
-            "label": dominant_guna,
-        },
-        # ── Vitals — null when PPG not available on this headset ──────────
+        "gunas": gunas_dict,
+        # Biometrics — null when headset has no PPG sensor
         "heart_rate": heart_rate,
-        "spo2": spo2,
+        "spo2":       spo2,
     }
 
 
 @app.post("/analyze/bands")
 async def analyze_bands(req: BandsRequest):
-    """
-    Classify from pre-computed band powers.
-    Also accepts optional heart_rate / spo2 already computed by the browser
-    and echoes them back so the UI can store them with the epoch.
-    """
+    """Classify from pre-computed relative band powers."""
     t0 = time.perf_counter()
 
-    delta = req.delta
-    theta = req.theta
-    alpha = req.alpha
-    beta = req.beta
-    gamma = req.gamma
-    total = delta + theta + alpha + beta + gamma or 1.0
+    tot = (req.delta + req.theta + req.alpha + req.beta + req.gamma) or 1.0
+    band_rel = {
+        "delta": req.delta / tot,
+        "theta": req.theta / tot,
+        "alpha": req.alpha / tot,
+        "beta":  req.beta  / tot,
+        "gamma": req.gamma / tot,
+    }
 
-    alpha_r = alpha / total
-    theta_r = theta / total
-    beta_r = beta / total
-    delta_r = delta / total
-    gamma_r = gamma / total
+    res    = _heuristic_classify(band_rel)
+    chitta = res["chitta"]
+    probs  = res["probs"]
+    depth  = _DEPTH[chitta]
 
-    # Simple heuristic classification without ML model
-    logits = [
-        beta_r * 3.0 + gamma_r * 1.5 - alpha_r * 1.5,   # Kshipta
-        alpha_r * 1.5 + beta_r * 1.5 - theta_r * 0.5,    # Vikshipta
-        alpha_r * 3.5 + theta_r * 1.0 - beta_r * 2.0,    # Ekagra
-        theta_r * 3.0 + delta_r * 2.0 - beta_r * 2.5,    # Niruddha
-    ]
-    states = ["Kshipta", "Vikshipta", "Ekagra", "Niruddha"]
-    max_logit = max(logits)
-    exps = [2.718281828 ** (l - max_logit) for l in logits]
-    s = sum(exps)
-    probs = [e / s for e in exps]
-    best = probs.index(max(probs))
-    chitta = states[best]
-    depth_map = {"Kshipta": "Surface", "Vikshipta": "Emerging", "Ekagra": "Deep", "Niruddha": "Profound"}
-    depth = depth_map[chitta]
-
-    elapsed = (time.perf_counter() - t0) * 1000
-    band_rel = {"delta": delta_r, "theta": theta_r, "alpha": alpha_r, "beta": beta_r, "gamma": gamma_r}
-
-    # Trigunas
-    sat = alpha_r * 3.0 + theta_r * 1.5
-    raj = beta_r * 3.0 + gamma_r * 2.5
-    tam = delta_r * 3.0
-    g_total = max(sat + raj + tam, 1e-9)
-    sat /= g_total; raj /= g_total; tam /= g_total
-    dominant_guna = "Sattvic" if sat >= raj and sat >= tam else ("Rajasic" if raj >= tam else "Tamasic")
+    a_r = band_rel["alpha"]; b_r = band_rel["beta"]
+    d_r = band_rel["delta"]; g_r = band_rel["gamma"]
+    sat = max(a_r * 3.0, 0.05)
+    raj = max(b_r * 3.0 + g_r * 2.5, 0.05)
+    tam = max(d_r * 3.0, 0.05)
+    gt  = sat + raj + tam
+    sat /= gt; raj /= gt; tam /= gt
+    dom = "Sattvic" if sat >= raj and sat >= tam else ("Rajasic" if raj >= tam else "Tamasic")
 
     return {
-        "latency_ms": round(elapsed, 1),
+        "latency_ms":   round((time.perf_counter() - t0) * 1000, 1),
+        "data_quality": "✓ pre-computed",
         "chitta_bhumi": {
-            "state": chitta,
-            "depth": depth,
-            "confidence": f"{max(probs) * 100:.1f}%",
-            "probabilities": {s: f"{p * 100:.1f}%" for s, p in zip(states, probs)},
+            "state":         chitta,
+            "depth":         depth,
+            "confidence":    f"{max(probs.values()) * 100:.1f}%",
+            "probabilities": {s: f"{p * 100:.1f}%" for s, p in probs.items()},
         },
-        "depth": depth,
-        "swara": {"state": "Sushumna — both nadis balanced", "confidence": "Moderate", "note": ""},
-        "tattva": [],
+        "depth":    depth,
+        "swara":    {"state": "Sushumna (Balanced / Central)", "confidence": "Moderate", "note": ""},
+        "tattva":   [],
         "tattva_flags": [],
         "eeg_spectrum": band_rel,
+        "alpha_asymmetry": 0.0,
         "gunas": {
-            "sattva": round(sat, 4),
-            "rajas": round(raj, 4),
-            "tamas": round(tam, 4),
-            "label": dominant_guna,
+            "sattva": round(sat, 4), "rajas": round(raj, 4), "tamas": round(tam, 4),
+            "label": dom, "note": "",
         },
-        # Echo back browser-computed vitals
+        # Echo browser-computed vitals
         "heart_rate": req.heart_rate,
-        "spo2": req.spo2,
+        "spo2":       req.spo2,
     }
