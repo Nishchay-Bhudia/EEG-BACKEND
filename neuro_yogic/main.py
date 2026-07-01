@@ -3,7 +3,7 @@ main.py -- Flask REST API Server
 =================================
 Exposes the EEG analysis pipeline as HTTP endpoints so a Vercel frontend
 (or any client) can POST raw EEG data and receive a live Chitta Bhumi /
-Swara / Tattva analysis in return.
+Swara / Tattva / Triguna analysis in return.
 
 Endpoints
 ---------
@@ -34,7 +34,8 @@ Or, if your frontend already computes band powers (e.g. via muse-js):
         "alpha_left": 0.20, "alpha_right": 0.25
     }
 
-Both endpoints return the same JSON response shape.
+Both endpoints return the same JSON response shape, now including a
+"gunas" block with Sattva / Rajas / Tamas percentages.
 
 CORS
 ----
@@ -53,6 +54,7 @@ from flask_cors import CORS
 
 from neuro_yogic.data_generator import DEFAULT_MODEL_PATH, save_dataset
 from neuro_yogic.feature_extractor import FeatureExtractor
+from neuro_yogic.satva_classifier import classify_gunas          # ← NEW
 from neuro_yogic.vedantic_logic import vedantic_analyze
 from neuro_yogic.yoga_classifier import YogaClassifier
 
@@ -96,6 +98,14 @@ def _build_response(chitta: str, probs: dict, info: dict) -> dict:
     reading  = vedantic_analyze(info, chitta_bhumi=chitta)
     band_rel = info.get("band_relative", {})
 
+    # ── Trigunas ────────────────────────────────────────────────────
+    # classify_gunas() accepts the relative band-power dict and the
+    # current Chitta Bhumi state.  It returns a dict with keys:
+    #   sattva, rajas, tamas  (floats that sum to 1.0)
+    #   label                 ("Sattvic" / "Rajasic" / "Tamasic" / "Balanced")
+    #   note                  (short human-readable interpretation)
+    gunas = classify_gunas(band_rel, chitta_bhumi=chitta)          # ← NEW
+
     return {
         "chitta_bhumi": {
             "state":         chitta,
@@ -115,6 +125,7 @@ def _build_response(chitta: str, probs: dict, info: dict) -> dict:
             ),
         },
         "is_padded": info.get("is_padded", False),
+        "gunas":     gunas,                                         # ← NEW
     }
 
 
@@ -142,7 +153,8 @@ def analyze():
 
     Returns
     -------
-    JSON with chitta_bhumi, swara, tattva, depth, eeg_spectrum, hemispheric_asymmetry
+    JSON with chitta_bhumi, swara, tattva, depth, eeg_spectrum,
+    hemispheric_asymmetry, and gunas (Sattva/Rajas/Tamas).
     """
     if not _model_ready:
         return jsonify({"error": "Model is still loading. Try again in a few seconds."}), 503
