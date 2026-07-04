@@ -118,37 +118,41 @@ def _safe_float(value):
 
 def _build_response(chitta: str, probs: dict, info: dict,
                     blood_oxygen=None, heart_rate=None) -> dict:
-    """Assemble the standard API response JSON."""
+    """Assemble the standard API response JSON.
+
+    FIXES:
+    * VedanticReading is a @dataclass, not a dict — calling .get() on it raised
+      AttributeError at runtime, making every /analyze call return a 500 error.
+      Use reading.to_dict() which is the class\'s own serialisation helper.
+    * classify_gunas(info) passed the full info dict as band_rel (wrong type/key).
+      Gunas are already computed inside vedantic_analyze; use vedantic["gunas"].
+    """
     reading = vedantic_analyze(info, chitta_bhumi=chitta)
     band_rel = info.get("band_relative", {})
 
-    gunas = classify_gunas(info)
+    # to_dict() returns {"swara":{...}, "tattva_flags":[...], "contemplative_depth":str, "gunas":{...}}
+    vedantic = reading.to_dict()
 
     resp = {
         "chitta_bhumi": {
-            "state": chitta,
-            "depth": reading.get("contemplative_depth", "Surface"),
-            "confidence": probs.get(chitta, "—"),
+            "state":         chitta,
+            "depth":         reading.contemplative_depth,
+            "confidence":    probs.get(chitta, "\u2014"),
             "probabilities": probs,
         },
-        "swara": {
-            "state": reading.get("swara", {}).get("state", "—"),
-            "confidence": reading.get("swara", {}).get("confidence", "—"),
-            "note": reading.get("swara", {}).get("note", ""),
-        },
-        "depth": reading.get("contemplative_depth", "Surface"),
-        "tattva_flags": reading.get("tattva_flags", []),
-        "eeg_spectrum": band_rel,
+        "swara":         vedantic["swara"],
+        "depth":         reading.contemplative_depth,
+        "tattva_flags":  reading.tattva_flags,
+        "eeg_spectrum":  band_rel,
         "band_relative": band_rel,
         "hemispheric_asymmetry": {
-            "asymmetry": info.get("alpha_asymmetry", 0),
-            "alpha_left": info.get("alpha_left", 0),
+            "asymmetry":   info.get("alpha_asymmetry", 0),
+            "alpha_left":  info.get("alpha_left",  0),
             "alpha_right": info.get("alpha_right", 0),
         },
-        "gunas": gunas,
+        "gunas":     vedantic["gunas"],
         "is_padded": info.get("is_padded", False),
     }
-
     # Only include vitals if the device actually reported them
     if blood_oxygen is not None:
         resp["blood_oxygen"] = _safe_float(blood_oxygen)
