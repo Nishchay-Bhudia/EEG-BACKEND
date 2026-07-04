@@ -3,9 +3,14 @@ services:
     name: neuro-yogic-eeg
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python run.py
+    # FIX: Use gunicorn for production instead of Flask's dev server.
+    # Single worker (-w 1) because the ML model is held in memory per process.
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT "neuro_yogic.main:app"
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: PYTHONDONTWRITEBYTECODE
         value: "1"
+      # Optional: lock down CORS to your Vercel domain in production
+      # - key: CORS_ORIGINS
+      #   value: "https://your-app.vercel.app"
