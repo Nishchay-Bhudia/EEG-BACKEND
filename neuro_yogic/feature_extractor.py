@@ -82,10 +82,22 @@ IAF_DEFAULT   = 10.0    # population-average fallback when no clear peak found
 
 # ── Artifact-detection thresholds ─────────────────────────────────────────────
 # Consumer dry-electrode headband (Muse), forehead + mastoid placement.
-ARTIFACT_AMPLITUDE_UV   = 300.0   # |sample| beyond this = blink/jaw/movement blow-out
+#
+# Recalibrated after real-hardware use: the original values (amplitude 300,
+# kurtosis 5.0, channel-fraction 0.5) rejected most/all epochs in practice —
+# a gate that's too strict is worse than one that's too lenient, since it
+# silently starves every downstream reading (Chitta Bhumi, Gunas, Swara) of
+# data rather than occasionally letting a slightly noisy epoch through.
+# Two specific things were wrong:
+#   - 300 µV doesn't tolerate a normal blink at frontal sites (AF7/AF8),
+#     which alone can hit 100-200+ µV — that's expected signal, not noise.
+#   - Kurtosis on a 512-sample (2s) window is a noisy statistic — clean
+#     EEG can swing well past 5.0 just from estimation variance at this
+#     window length, not because anything is actually wrong with the signal.
+ARTIFACT_AMPLITUDE_UV   = 600.0   # |sample| beyond this = blink/jaw/movement blow-out
 ARTIFACT_FLATLINE_STD   = 0.05    # channel std below this = poor contact / disconnect
-ARTIFACT_KURTOSIS       = 5.0     # excess kurtosis above this = spiky non-Gaussian noise
-ARTIFACT_CHANNEL_FRAC   = 0.5     # reject epoch if >=50% of channels are flagged
+ARTIFACT_KURTOSIS       = 12.0    # excess kurtosis above this = spiky non-Gaussian noise
+ARTIFACT_CHANNEL_FRAC   = 0.75    # reject epoch only if >=75% of channels are flagged
 
 # Feature vector column names (10-D)
 FEATURE_COLUMNS = [
