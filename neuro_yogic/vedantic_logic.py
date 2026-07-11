@@ -20,7 +20,10 @@ TATTVA / CHAKRA CORRELATES
   - High PLV (>0.80) + low High-Beta  → Sushumna activation / Niruddha
 
 TRIGUNAS
-  Derived from band powers + FAA + PLV + Chitta Bhumi via satva_classifier.py
+  Derived from band powers + PLV + Chitta Bhumi via satva_classifier.py.
+  Deliberately NOT derived from FAA/Swara — see satva_classifier.py's
+  module docstring for why Guna intensity and Nadi lateralization are
+  treated as independent constructs here.
 
 CHITTA BHUMI DEPTH MAPPING (v2 — 5 states)
   Mudha     → "Deep Inertia"  (lowest — Tamas dominant)
@@ -249,19 +252,14 @@ def vedantic_analyze(
     contemplative_depth = _BHUMI_DEPTH.get(chitta_bhumi or "", "Surface")
 
     # ── Trigunas (paper-aligned scorer) ───────────────────────────────────
-    # Extract swara key for secondary adjustment
-    swara_key = (
-        "sushumna" if "sushumna" in swara_state.lower()
-        else "ida"    if "ida"     in swara_state.lower()
-        else "pingala"
-    )
-
+    # NOTE: Gunas (activity/inertia/clarity) are intentionally NOT derived
+    # from FAA/Swara here — Nadi lateralization and Guna intensity are
+    # separate constructs with no established correlation. See
+    # satva_classifier.py's module docstring for the full rationale.
     gunas = classify_gunas(
         band_rel,
-        faa=faa,
         plv=plv,
         chitta_bhumi=chitta_bhumi,
-        swara=swara_key,
     )
     glabel = gunas_label(gunas)
     gnote  = gunas_note(gunas)

@@ -18,6 +18,18 @@ Key changes in v2:
     If high_beta is absent, total beta is split 55/45 (low/high) as an estimate.
   • _build_response includes faa / plv / alpha_asymmetry in the response.
 
+Key changes in v3:
+  • Both /analyze and /analyze/bands accept optional `baseline` (personal
+    calibration) and `recent_probs` (temporal smoothing history) — see
+    yoga_classifier.py.
+  • /analyze now actually rejects (422) artifact-contaminated epochs
+    instead of only reporting a padding flag — see
+    FeatureExtractor._detect_artifacts.
+  • Chitta Bhumi band edges (theta/alpha/low_beta) are IAF-anchored per
+    epoch rather than fixed population ranges — see
+    FeatureExtractor._detect_iaf.
+  • Gunas no longer take FAA/Swara as input — see satva_classifier.py.
+
 CORS
 ----
 All origins allowed by default. Set CORS_ORIGINS env var to restrict.
@@ -120,6 +132,12 @@ def _build_response(chitta: str, probs: dict, info: dict,
         },
         "gunas":     vedantic["gunas"],
         "is_padded": info.get("is_padded", False),
+        "iaf":          info.get("iaf"),
+        "iaf_detected": info.get("iaf_detected", False),
+        "signal_quality": {
+            "fraction_flagged": info.get("artifact", {}).get("fraction_flagged", 0.0),
+            "channels_flagged": info.get("artifact", {}).get("channels_flagged", []),
+        },
     }
     if blood_oxygen is not None:
         resp["blood_oxygen"] = _safe_float(blood_oxygen)
@@ -151,16 +169,26 @@ def analyze():
 
     Request body (JSON)
     -------------------
-    eeg_data    : list[list[float]] -- (n_channels × n_samples), raw µV values
-    sample_rate : int               -- samples/sec (256 for Muse 2 / Muse S)
-    blood_oxygen: float | null      -- optional SpO2 %
-    heart_rate  : float | null      -- optional HR BPM (from Muse S PPG)
+    eeg_data     : list[list[float]] -- (n_channels × n_samples), raw µV values
+    sample_rate  : int               -- samples/sec (256 for Muse 2 / Muse S)
+    blood_oxygen : float | null      -- optional SpO2 %
+    heart_rate   : float | null      -- optional HR BPM (from Muse S PPG)
+    baseline     : dict | null       -- optional personal calibration, per band:
+                                        {"delta": {"mean":.., "std":..}, ...} —
+                                        see yoga_classifier._apply_baseline.
+    recent_probs : list | null       -- optional last few epochs' probability
+                                        dicts (oldest→newest) for temporal
+                                        smoothing — see yoga_classifier._smooth_probs.
 
     Returns
     -------
     JSON with chitta_bhumi, swara, tattva_flags, depth, eeg_spectrum (all 6
     bands including high_beta), band_relative, hemispheric_asymmetry (+ faa/plv),
     gunas (sattva/rajas/tamas percentages), and optionally blood_oxygen/heart_rate.
+
+    422 is returned (not a classification) when the epoch is too contaminated
+    by artifacts to trust — see FeatureExtractor._detect_artifacts. Artifact
+    detection is a real gate here, not just an informational flag.
     """
     if not _model_ready:
         return jsonify({"error": "Classifier initialising. Try again in a few seconds."}), 503
@@ -173,6 +201,8 @@ def analyze():
     sample_rate  = int(body.get("sample_rate", 256))
     blood_oxygen = body.get("blood_oxygen")
     heart_rate   = body.get("heart_rate")
+    baseline     = body.get("baseline") if isinstance(body.get("baseline"), dict) else None
+    recent_probs = body.get("recent_probs") if isinstance(body.get("recent_probs"), list) else None
 
     if eeg_data is None:
         return jsonify({"error": "Missing 'eeg_data' field."}), 400
@@ -196,10 +226,20 @@ def analyze():
     if np.all(features == 0):
         return jsonify({"error": "All-zero signal — check electrode contact and headband connection."}), 422
 
+    artifact = info.get("artifact", {})
+    if artifact.get("detected"):
+        return jsonify({
+            "error": "Signal quality too poor to classify — artifacts detected on "
+                     f"{len(artifact.get('channels_flagged', []))} channel(s).",
+            "artifact": artifact,
+        }), 422
+
     try:
         with _model_lock:
             # v2: classify_from_info uses the full info dict (faa, plv, high_beta, etc.)
-            chitta, probs = _classifier.classify_from_info(info)
+            chitta, probs = _classifier.classify_from_info(
+                info, baseline=baseline, recent_probs=recent_probs
+            )
     except Exception as exc:
         log.exception("Classification failed")
         return jsonify({"error": f"Classification failed: {exc}"}), 500
@@ -227,6 +267,8 @@ def analyze_bands():
     plv                 : float -- (optional) pre-computed PLV (0-1)
     blood_oxygen        : float | null -- optional SpO2 %
     heart_rate          : float | null -- optional HR BPM
+    baseline            : dict | null  -- optional personal calibration (see /analyze)
+    recent_probs        : list | null  -- optional recent-epoch history (see /analyze)
     """
     if not _model_ready:
         return jsonify({"error": "Classifier initialising. Try again in a few seconds."}), 503
@@ -270,6 +312,8 @@ def analyze_bands():
 
     blood_oxygen = body.get("blood_oxygen")
     heart_rate   = body.get("heart_rate")
+    baseline     = body.get("baseline") if isinstance(body.get("baseline"), dict) else None
+    recent_probs = body.get("recent_probs") if isinstance(body.get("recent_probs"), list) else None
 
     # Normalise so all 6 bands sum to 1
     total = delta + theta + alpha + high_beta + low_beta + gamma or 1e-10
@@ -296,7 +340,9 @@ def analyze_bands():
 
     try:
         with _model_lock:
-            chitta, probs = _classifier.classify_from_info(info)
+            chitta, probs = _classifier.classify_from_info(
+                info, baseline=baseline, recent_probs=recent_probs
+            )
     except Exception as exc:
         log.exception("Classification failed")
         return jsonify({"error": f"Classification failed: {exc}"}), 500

@@ -27,11 +27,37 @@ Scoring logic:
 ──────────────
 Each state receives a fuzzy score based on EEG feature thresholds from the
 paper. Scores are normalised to probabilities. The highest-scoring state wins.
+
+Personal baseline z-scoring (root-cause fix for the trait/state confound)
+───────────────────────────────────────────────────────────────────────────
+Fixed thresholds like "gamma > 0.15 = Niruddha" assume every subject's
+resting band power sits at the same population baseline. It doesn't — Cahn &
+Polich (2006) specifically flag that elevated gamma in experienced
+meditators is often a *trait* effect of long-term practice, not a
+within-session *state* change. Someone whose resting gamma naturally sits
+at 15% shouldn't register as "Niruddha" just for existing.
+`classify_from_info` accepts an optional `baseline` dict (per-band
+{"mean": .., "std": ..}, computed by the caller from a short resting
+calibration period) and re-centers each band's power on the *population*
+reference before scoring: a value that is 2 std above someone's own
+baseline reads the same as 2 std above the population baseline, regardless
+of where that person's resting level actually sits. No baseline supplied →
+identical behaviour to before (fully backward compatible).
+
+Temporal smoothing
+───────────────────
+Each 2 s epoch was previously classified in total isolation — no memory of
+the previous epoch — so single noisy epochs could flip the displayed state
+every couple of seconds. `classify_from_info` accepts an optional
+`recent_probs` list (the caller's last few epochs' probability dicts,
+oldest→newest) and blends them into the current epoch via an exponential
+moving average before picking a winner, damping single-epoch noise while
+still tracking genuine state changes within a few epochs.
 """
 
 import os
 import numpy as np
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 # ── Class definitions ─────────────────────────────────────────────────────────
 CHITTA_BHUMIS = ["Mudha", "Kshipta", "Vikshipta", "Ekagra", "Niruddha"]
@@ -43,17 +69,93 @@ FEATURE_COLUMNS     = [
     "alpha_left", "alpha_right", "faa", "plv",
 ]
 
+# ── Population reference (heuristic priors, not empirically fit) ─────────────
+# These match the existing fallback defaults already used below (br.get(..,
+# default)) — reused here as the "population mean" that a personal baseline
+# gets re-centered onto. Std is a rough 35% coefficient of variation, a
+# commonly cited ballpark for relative EEG band-power variability; there is
+# no dataset behind these specific numbers, so treat them as a documented
+# heuristic, not a calibrated constant.
+_POPULATION_BAND_MEANS = {
+    "delta": 0.15, "theta": 0.18, "alpha": 0.28,
+    "low_beta": 0.18, "high_beta": 0.13, "gamma": 0.08,
+}
+_POPULATION_BAND_STDS = {k: max(v * 0.35, 0.02) for k, v in _POPULATION_BAND_MEANS.items()}
+
+# ── Temporal smoothing ────────────────────────────────────────────────────────
+SMOOTHING_DECAY = 0.6   # per-step-back discount applied to older epochs
+
+
+def _apply_baseline(band_rel: dict, baseline: Optional[dict]) -> dict:
+    """
+    Re-center each band's relative power on the population mean, scaled by
+    this person's own deviation from their baseline (z-score). See module
+    docstring. Returns band_rel unchanged when no baseline is supplied.
+    """
+    if not baseline:
+        return dict(band_rel)
+
+    adjusted = dict(band_rel)
+    for band, mean_pop in _POPULATION_BAND_MEANS.items():
+        stats = baseline.get(band)
+        if not stats or band not in band_rel:
+            continue
+        try:
+            personal_mean = float(stats.get("mean", band_rel[band]))
+            personal_std  = float(stats.get("std", 0.0)) or 1e-6
+        except (TypeError, ValueError):
+            continue
+        z = (float(band_rel[band]) - personal_mean) / personal_std
+        std_pop = _POPULATION_BAND_STDS.get(band, personal_std)
+        adjusted[band] = max(0.0, mean_pop + z * std_pop)
+    return adjusted
+
+
+def _smooth_probs(current: dict, recent: Optional[List[dict]]) -> dict:
+    """
+    Exponential moving average across recent epochs' probability
+    distributions (oldest→newest), so a single noisy epoch can't flip the
+    displayed Chitta Bhumi on its own. Returns `current` unchanged when no
+    history is supplied.
+    """
+    if not recent:
+        return dict(current)
+
+    blended = dict(current)
+    weight = 1.0
+    weight_total = 1.0
+    for probs in reversed(recent):
+        weight *= SMOOTHING_DECAY
+        if weight < 1e-3:
+            break
+        for k, v in probs.items():
+            try:
+                blended[k] = blended.get(k, 0.0) + weight * float(v)
+            except (TypeError, ValueError):
+                continue
+        weight_total += weight
+    return {k: v / weight_total for k, v in blended.items()}
+
 
 # ── Core rule-based classifier ────────────────────────────────────────────────
 
-def _rule_classify(info: dict) -> Tuple[str, dict]:
+def _rule_classify(
+    info: dict,
+    baseline: Optional[dict] = None,
+    recent_probs: Optional[List[dict]] = None,
+) -> Tuple[str, dict]:
     """
     Paper-derived fuzzy rule classifier.
 
     Takes the full `info` dict from FeatureExtractor (or a compatible dict
     from the /analyze/bands endpoint) and returns (label, probability_dict).
+
+    baseline     : optional per-band {"mean", "std"} from the caller's own
+                   resting calibration — see _apply_baseline.
+    recent_probs : optional list of this session's last few probability
+                   dicts (oldest→newest) — see _smooth_probs.
     """
-    br = info.get("band_relative", {})
+    br = _apply_baseline(info.get("band_relative", {}), baseline)
 
     delta    = float(br.get("delta",     0.15))
     theta    = float(br.get("theta",     0.18))
@@ -147,9 +249,15 @@ def _rule_classify(info: dict) -> Tuple[str, dict]:
     total = sum(scores.values()) or 1e-10
     probs = {k: round(v / total, 4) for k, v in scores.items()}
 
-    # Winner
-    label = max(scores, key=scores.get)
-    return label, probs
+    # ── Temporal smoothing across recent epochs ────────────────────────────
+    # Blend with the caller's recent-epoch history so one noisy 2s epoch
+    # can't flip the displayed state on its own. Winner is picked from the
+    # smoothed distribution, not the raw single-epoch one.
+    smoothed = _smooth_probs(probs, recent_probs)
+    smoothed = {k: round(v, 4) for k, v in smoothed.items()}
+
+    label = max(smoothed, key=smoothed.get)
+    return label, smoothed
 
 
 # ── Public classifier class (API-compatible with v1) ─────────────────────────
@@ -168,14 +276,22 @@ class YogaClassifier:
         self._is_trained = True
 
     # ── Recommended interface ──────────────────────────────────────────────────
-    def classify_from_info(self, info: dict) -> Tuple[str, dict]:
+    def classify_from_info(
+        self,
+        info: dict,
+        baseline: Optional[dict] = None,
+        recent_probs: Optional[List[dict]] = None,
+    ) -> Tuple[str, dict]:
         """
         Classify using the full info dict from FeatureExtractor.
         This is the primary interface — no feature array gymnastics required.
 
+        baseline     : optional personal calibration — see _apply_baseline.
+        recent_probs : optional recent-epoch history — see _smooth_probs.
+
         Returns (chitta_bhumi_label, probability_dict).
         """
-        return _rule_classify(info)
+        return _rule_classify(info, baseline=baseline, recent_probs=recent_probs)
 
     # ── Legacy interface (backward-compatible with main.py v1) ───────────────
     def predict(self, features: np.ndarray) -> str:
